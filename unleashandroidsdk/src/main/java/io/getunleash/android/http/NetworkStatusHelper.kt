@@ -6,54 +6,110 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import io.getunleash.android.util.UnleashLogger
+import java.util.concurrent.atomic.AtomicInteger
 
 interface NetworkListener {
     fun onAvailable()
     fun onLost()
 }
 
-class NetworkStatusHelper(private val context: Context) {
+class NetworkStatusHelper(
+    private val context: Context,
+    private val scheduleRetry: (Long, () -> Unit) -> Unit = { delayMs, action ->
+        Handler(Looper.getMainLooper()).postDelayed(action, delayMs)
+    }
+) {
     companion object {
         private const val TAG = "NetworkState"
+        internal const val MAX_REGISTRATION_ATTEMPTS = 5
+        private const val REGISTRATION_RETRY_DELAY_MS = 200L
     }
 
     internal val networkCallbacks = mutableListOf<ConnectivityManager.NetworkCallback>()
 
     private val availableNetworks = mutableSetOf<Network>()
 
+    private val registrationEpoch = AtomicInteger(0)
+
     fun registerNetworkListener(listener: NetworkListener) {
-        val connectivityManager = getConnectivityManager() ?: return
-        val requestBuilder = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            requestBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val epoch = registrationEpoch.get()
+        registerNetworkListener(listener, MAX_REGISTRATION_ATTEMPTS, epoch)
+    }
+
+    private fun registerNetworkListener(
+        listener: NetworkListener,
+        remainingAttempts: Int,
+        epoch: Int
+    ) {
+        if (epoch != registrationEpoch.get()) {
+            UnleashLogger.d(TAG, "Skipping stale network registration attempt")
+            return
         }
-        val networkRequest = requestBuilder.build()
 
-        // wrap the listener in a NetworkCallback so the listener doesn't have to know about Android specifics
-        val networkCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                availableNetworks += network
-                listener.onAvailable()
+        val attemptNumber = MAX_REGISTRATION_ATTEMPTS - remainingAttempts + 1
+        try {
+            val connectivityManager = getConnectivityManager() ?: return
+            val networkRequest = buildNetworkRequest()
+
+            val networkCallback = buildCallback(listener)
+            connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+            if (epoch != registrationEpoch.get()) {
+                UnleashLogger.d(TAG, "Registration completed for stale attempt; unregistering callback")
+                connectivityManager.unregisterNetworkCallback(networkCallback)
+                return
             }
-
-            override fun onLost(network: Network) {
-                availableNetworks -= network
-                if (availableNetworks.isEmpty()) {
-                    listener.onLost()
+            networkCallbacks += networkCallback
+        } catch (securityException: SecurityException) {
+            if (remainingAttempts > 1) {
+                UnleashLogger.w(
+                    TAG,
+                    "registerNetworkCallback failed on attempt $attemptNumber/$MAX_REGISTRATION_ATTEMPTS; retrying in $REGISTRATION_RETRY_DELAY_MS ms",
+                    securityException
+                )
+                if (epoch == registrationEpoch.get()) {
+                    scheduleRetry(REGISTRATION_RETRY_DELAY_MS) {
+                        registerNetworkListener(listener, remainingAttempts - 1, epoch)
+                    }
                 }
+            } else {
+                UnleashLogger.w(
+                    TAG,
+                    "registerNetworkCallback failed after $attemptNumber attempts; network updates disabled",
+                    securityException
+                )
             }
         }
-
-        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
-        networkCallbacks += networkCallback
     }
 
     fun close() {
-        val connectivityManager = getConnectivityManager() ?: return
-        networkCallbacks.forEach {
-            connectivityManager.unregisterNetworkCallback(it)
+        val epoch = registrationEpoch.incrementAndGet()
+        val connectivityManager = getConnectivityManager() ?: run {
+            networkCallbacks.clear()
+            availableNetworks.clear()
+            return
+        }
+        val callbacks = networkCallbacks.toList()
+        networkCallbacks.clear()
+        availableNetworks.clear()
+        callbacks.forEach { callback ->
+            try {
+                connectivityManager.unregisterNetworkCallback(callback)
+            } catch (illegalArgumentException: IllegalArgumentException) {
+                UnleashLogger.w(
+                    TAG,
+                    "NetworkCallback already unregistered during close (epoch=$epoch)",
+                    illegalArgumentException
+                )
+            } catch (securityException: SecurityException) {
+                UnleashLogger.w(
+                    TAG,
+                    "SecurityException while unregistering NetworkCallback during close (epoch=$epoch)",
+                    securityException
+                )
+            }
         }
     }
 
@@ -93,4 +149,28 @@ class NetworkStatusHelper(private val context: Context) {
     fun isAvailable(): Boolean {
         return !isAirplaneModeOn() && isNetworkAvailable()
     }
+
+    private fun buildNetworkRequest(): NetworkRequest {
+        val requestBuilder = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            requestBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        }
+        return requestBuilder.build()
+    }
+
+    private fun buildCallback(listener: NetworkListener) =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                availableNetworks += network
+                listener.onAvailable()
+            }
+
+            override fun onLost(network: Network) {
+                availableNetworks -= network
+                if (availableNetworks.isEmpty()) {
+                    listener.onLost()
+                }
+            }
+        }
 }
